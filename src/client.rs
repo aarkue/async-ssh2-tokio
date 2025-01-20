@@ -7,9 +7,10 @@ use russh::{
 use russh_sftp::{client::SftpSession, protocol::OpenFlags};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use std::{fmt::Debug, path::Path};
 use std::{io, path::PathBuf};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 
 use crate::ToSocketAddrsWithHostname;
 
@@ -273,7 +274,7 @@ impl Client {
         match auth {
             AuthMethod::Password(password) => {
                 let is_authentificated = handle.authenticate_password(username, password).await?;
-                if !is_authentificated {
+                if !is_authentificated.success() {
                     return Err(crate::Error::PasswordWrong);
                 }
             }
@@ -287,7 +288,7 @@ impl Client {
                             .map_err(crate::Error::KeyInvalid)?,
                     )
                     .await?;
-                if !is_authentificated {
+                if !is_authentificated.success() {
                     return Err(crate::Error::KeyAuthFailed);
                 }
             }
@@ -304,7 +305,7 @@ impl Client {
                             .map_err(crate::Error::KeyInvalid)?,
                     )
                     .await?;
-                if !is_authentificated {
+                if !is_authentificated.success() {
                     return Err(crate::Error::KeyAuthFailed);
                 }
             }
@@ -330,8 +331,8 @@ impl Client {
                     return Err(crate::Error::KeyAuthFailed);
                 }
 
-                let auth_success = handle.authenticate_publickey_with(username, cpubk, &mut agent).await?;
-                if !auth_success {
+                let auth_res = handle.authenticate_publickey_with(username, cpubk, None,&mut agent).await?;
+                if auth_res.success() {
                     return Err(crate::Error::KeyAuthFailed);
                 }
             }
@@ -342,7 +343,9 @@ impl Client {
                 loop {
                     let prompts = match res {
                         KeyboardInteractiveAuthResponse::Success => break,
-                        KeyboardInteractiveAuthResponse::Failure => {
+                        KeyboardInteractiveAuthResponse::Failure {
+                            remaining_methods
+                        } => {
                             return Err(crate::Error::KeyboardInteractiveAuthFailed);
                         }
                         KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => prompts,
@@ -440,10 +443,14 @@ impl Client {
         channel.request_subsystem(true, "sftp").await?;
         let sftp = SftpSession::new(channel.into_stream()).await?;
 
+        let file_size = 1024 * 1024 * 1024;
+
+        let now = Instant::now();
         // read file contents locally
-        let file_contents = tokio::fs::read(src_file_path)
-            .await
-            .map_err(crate::Error::IoError)?;
+        // let file_contents = tokio::fs::read(src_file_path)
+        //     .await
+        //     .map_err(crate::Error::IoError)?;
+        // println!("Read file locally in {:?}",now.elapsed());
 
         // interaction with i/o
         let mut file = sftp
@@ -452,11 +459,18 @@ impl Client {
                 OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE | OpenFlags::READ,
             )
             .await?;
-        file.write_all(&file_contents)
-            .await
-            .map_err(crate::Error::IoError)?;
+
+        let src_file = tokio::fs::File::open(&src_file_path).await.map_err(crate::Error::IoError)?;
+        // let mut buf = Vec::with_capacity(file_size);
+        let mut reader = BufReader::with_capacity(file_size, src_file);
+        let mut writer = BufWriter::new(&mut file);
+        tokio::io::copy_buf(&mut reader, &mut writer).await?;
+        // file.write_all(&file_contents)
+        //     .await
+        //     .map_err(crate::Error::IoError)?;
         file.flush().await.map_err(crate::Error::IoError)?;
         file.shutdown().await.map_err(crate::Error::IoError)?;
+        println!("Finished writing file in {:?} (total)",now.elapsed());
 
         Ok(())
     }
